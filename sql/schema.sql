@@ -1,12 +1,9 @@
-USE hospital_db;
-
-DROP TABLE IF EXISTS fee_audit_log;
+-- Hospital Management System Schema
 DROP TABLE IF EXISTS payments;
-DROP TABLE IF EXISTS medical_records;
-DROP TABLE IF EXISTS appointments;          
+DROP TABLE IF EXISTS appointments;
 DROP TABLE IF EXISTS chambers;
 DROP TABLE IF EXISTS patients;
-DROP TABLE IF EXISTS doctors;
+DROP TABLE IF EXISTS doctors;   
 
 -- 1. Doctors Table
 CREATE TABLE doctors (
@@ -52,7 +49,6 @@ CREATE TABLE appointments (
     doctor_id INT NOT NULL,
     chamber_id INT,
     appointment_date DATE NOT NULL,
-    appointment_time ENUM('09:00', '10:00', '11:00', '14:00', '15:00', '16:00', '17:00'),
     status ENUM('scheduled', 'completed', 'cancelled') DEFAULT 'scheduled',
     reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -61,34 +57,13 @@ CREATE TABLE appointments (
     FOREIGN KEY (chamber_id) REFERENCES chambers(id) ON DELETE SET NULL
 );
 
--- 5. Medical Records Table
-CREATE TABLE medical_records (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    appointment_id INT NOT NULL,
-    diagnosis TEXT,
-    prescription TEXT,
-    notes TEXT,
-    record_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE CASCADE
-);
-
--- 6. Payments Table
+-- 5. Payments Table
 CREATE TABLE payments (
     id INT AUTO_INCREMENT PRIMARY KEY,
     appointment_id INT NOT NULL,
     amount DECIMAL(10,2) NOT NULL,
-    payment_method ENUM('Cash', 'Card', 'bKash', 'Nagad') DEFAULT 'Cash',
     status ENUM('pending', 'paid', 'failed') DEFAULT 'pending',
     payment_date TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (appointment_id) REFERENCES appointments(id) ON DELETE CASCADE
-);
-
--- 7. Fee Audit Log Table
-CREATE TABLE fee_audit_log (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    doctor_id INT,
-    old_fee DECIMAL(10,2),
-    new_fee DECIMAL(10,2),
-    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE
 );

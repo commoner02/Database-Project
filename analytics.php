@@ -1,186 +1,53 @@
 <?php
 require_once 'config/database.php';
 
-// Check database connection
-if (!$db->conn) {
-    die("Database connection failed: " . $db->conn->connect_error);
-}
+// Fetch analytics data
+$total_revenue = $db->query("SELECT SUM(amount) as total FROM payments WHERE status = 'paid'")->fetch_assoc()['total'] ?? 0;
+$platform_revenue = $db->query("SELECT SUM(c.chamber_fee) as total FROM payments p JOIN appointments a ON p.appointment_id = a.id JOIN chambers c ON a.chamber_id = c.id WHERE p.status = 'paid'")->fetch_assoc()['total'] ?? 0;
+$total_appointments = $db->query("SELECT COUNT(*) as total FROM appointments")->fetch_assoc()['total'];
+$completed_appointments = $db->query("SELECT COUNT(*) as total FROM appointments WHERE status = 'completed'")->fetch_assoc()['total'];
 
-// Initialize variables to prevent undefined variable errors
-$revenue_by_speciality = $todays_appointments = $doctor_performance = $doctor_monthly_revenue = 
-$monthly_revenue = $high_performing_doctors = $appointment_details = $fee_changes = null;
+// Monthly revenue
+$monthly_revenue = $db->query("
+    SELECT YEAR(payment_date) as year, MONTH(payment_date) as month, SUM(amount) as revenue
+    FROM payments 
+    WHERE status = 'paid' AND payment_date >= DATE_SUB(NOW(), INTERVAL 6 MONTH)
+    GROUP BY YEAR(payment_date), MONTH(payment_date)
+    ORDER BY year DESC, month DESC
+    LIMIT 6
+");
 
-// Real-world analytics using database functions and views
-try {
-    $revenue_by_speciality = $db->query("
-        SELECT d.speciality, 
-               COUNT(a.id) as total_appointments,
-               SUM(p.amount) as total_revenue
-        FROM doctors d 
-        LEFT JOIN appointments a ON d.id = a.doctor_id 
-        LEFT JOIN payments p ON a.id = p.appointment_id 
-        WHERE p.status = 'paid'
-        GROUP BY d.speciality 
-        ORDER BY total_revenue DESC
-    ");
+// Doctor performance
+$doctor_performance = $db->query("
+    SELECT d.name, d.speciality, COUNT(a.id) as appointments, SUM(p.amount) as revenue
+    FROM doctors d 
+    LEFT JOIN appointments a ON d.id = a.doctor_id 
+    LEFT JOIN payments p ON a.id = p.appointment_id AND p.status = 'paid'
+    GROUP BY d.id, d.name, d.speciality
+    ORDER BY revenue DESC
+");
 
-    // Check if views exist before querying them
-    $view_check = $db->query("SHOW TABLES LIKE 'todays_appointments'");
-    if ($view_check && $view_check->num_rows > 0) {
-        $todays_appointments = $db->query("SELECT * FROM todays_appointments");
-    } else {
-        // Fallback query if view doesn't exist
-        $todays_appointments = $db->query("
-            SELECT a.id, a.appointment_time,
-                   p.name as patient_name, p.phone as patient_phone,
-                   d.name as doctor_name, d.speciality,
-                   c.chamber_name, c.location
-            FROM appointments a
-            JOIN patients p ON a.patient_id = p.id
-            JOIN doctors d ON a.doctor_id = d.id
-            LEFT JOIN chambers c ON a.chamber_id = c.id
-            WHERE a.appointment_date = CURDATE() 
-            AND a.status = 'scheduled'
-            ORDER BY a.appointment_time
-        ");
-    }
+// Speciality-wise revenue
+$speciality_revenue = $db->query("
+    SELECT d.speciality, SUM(p.amount) as revenue
+    FROM doctors d 
+    JOIN appointments a ON d.id = a.doctor_id 
+    JOIN payments p ON a.id = p.appointment_id 
+    WHERE p.status = 'paid'
+    GROUP BY d.speciality
+    ORDER BY revenue DESC
+");
 
-    // Check if doctor_performance view exists
-    $view_check2 = $db->query("SHOW TABLES LIKE 'doctor_performance'");
-    if ($view_check2 && $view_check2->num_rows > 0) {
-        $doctor_performance = $db->query("SELECT * FROM doctor_performance ORDER BY total_revenue DESC");
-    } else {
-        // Fallback query
-        $doctor_performance = $db->query("
-            SELECT 
-                d.id, d.name, d.speciality, d.experience,
-                COUNT(a.id) as total_appointments,
-                SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) as completed_appointments,
-                COALESCE(SUM(p.amount), 0) as total_revenue,
-                COALESCE(AVG(p.amount), 0) as avg_revenue_per_appointment
-            FROM doctors d
-            LEFT JOIN appointments a ON d.id = a.doctor_id
-            LEFT JOIN payments p ON a.id = p.appointment_id AND p.status = 'paid'
-            GROUP BY d.id
-            ORDER BY total_revenue DESC
-        ");
-    }
-
-    // Check if function exists
-    $func_check = $db->query("
-        SELECT COUNT(*) as func_exists 
-        FROM information_schema.ROUTINES 
-        WHERE ROUTINE_TYPE = 'FUNCTION' 
-        AND ROUTINE_NAME = 'calculate_doctor_revenue'
-        AND ROUTINE_SCHEMA = 'hospital_db'
-    ");
-    
-    $func_exists = $func_check ? $func_check->fetch_assoc()['func_exists'] : 0;
-    
-    if ($func_exists) {
-        $doctor_monthly_revenue = $db->query("
-            SELECT name, speciality, 
-                   calculate_doctor_revenue(id, MONTH(CURDATE()), YEAR(CURDATE())) as current_month_revenue,
-                   calculate_doctor_revenue(id, MONTH(CURDATE())-1, YEAR(CURDATE())) as last_month_revenue
-            FROM doctors
-            ORDER BY current_month_revenue DESC
-        ");
-    } else {
-        // Fallback without function
-        $doctor_monthly_revenue = $db->query("
-            SELECT d.name, d.speciality,
-                   COALESCE(SUM(CASE WHEN MONTH(a.appointment_date) = MONTH(CURDATE()) AND YEAR(a.appointment_date) = YEAR(CURDATE()) THEN p.amount ELSE 0 END), 0) as current_month_revenue,
-                   COALESCE(SUM(CASE WHEN MONTH(a.appointment_date) = MONTH(CURDATE())-1 AND YEAR(a.appointment_date) = YEAR(CURDATE()) THEN p.amount ELSE 0 END), 0) as last_month_revenue
-            FROM doctors d
-            LEFT JOIN appointments a ON d.id = a.doctor_id
-            LEFT JOIN payments p ON a.id = p.appointment_id AND p.status = 'paid'
-            GROUP BY d.id, d.name, d.speciality
-            ORDER BY current_month_revenue DESC
-        ");
-    }
-
-    // Monthly revenue
-    $monthly_revenue = $db->query("
-        SELECT DATE_FORMAT(a.appointment_date, '%Y-%m') as month,
-               d.speciality,
-               COUNT(a.id) as appointment_count,
-               SUM(p.amount) as total_revenue
-        FROM appointments a
-        JOIN doctors d ON a.doctor_id = d.id
-        JOIN payments p ON a.id = p.appointment_id
-        WHERE p.status = 'paid'
-        GROUP BY DATE_FORMAT(a.appointment_date, '%Y-%m'), d.speciality
-        ORDER BY month DESC, total_revenue DESC
-        LIMIT 6
-    ");
-
-    // HAVING clause example - High performing doctors
-    $high_performing_doctors = $db->query("
-        SELECT d.name, d.speciality,
-               COUNT(a.id) as appointment_count,
-               SUM(p.amount) as total_revenue
-        FROM doctors d 
-        JOIN appointments a ON d.id = a.doctor_id 
-        JOIN payments p ON a.id = p.appointment_id 
-        WHERE p.status = 'paid'
-        GROUP BY d.id, d.name, d.speciality 
-        HAVING COUNT(a.id) > 0 AND SUM(p.amount) > 0
-        ORDER BY total_revenue DESC
-        LIMIT 10
-    ");
-
-    // Multiple table joins - Complete appointment details
-    $appointment_details = $db->query("
-        SELECT a.appointment_date, a.appointment_time, 
-               p.name as patient_name, p.blood_group, p.age,
-               d.name as doctor_name, d.speciality,
-               c.chamber_name,
-               pay.amount, pay.status as payment_status,
-               m.diagnosis
-        FROM appointments a
-        INNER JOIN patients p ON a.patient_id = p.id
-        INNER JOIN doctors d ON a.doctor_id = d.id
-        LEFT JOIN chambers c ON a.chamber_id = c.id
-        LEFT JOIN payments pay ON a.id = pay.appointment_id
-        LEFT JOIN medical_records m ON a.id = m.appointment_id
-        ORDER BY a.appointment_date DESC 
-        LIMIT 10
-    ");
-
-    // Fee change audit
-    $fee_changes = $db->query("
-        SELECT f.*, d.name as doctor_name 
-        FROM fee_audit_log f 
-        JOIN doctors d ON f.doctor_id = d.id 
-        ORDER BY f.changed_at DESC 
-        LIMIT 10
-    ");
-
-} catch (Exception $e) {
-    $error = "Database query error: " . $e->getMessage();
-}
-
-// Stats with aggregates (with error handling)
-try {
-    $stats = [
-        'total_revenue' => $db->query("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status='paid'")->fetch_assoc()['total'] ?? 0,
-        'total_patients' => $db->query("SELECT COUNT(*) as total FROM patients")->fetch_assoc()['total'] ?? 0,
-        'total_doctors' => $db->query("SELECT COUNT(*) as total FROM doctors")->fetch_assoc()['total'] ?? 0,
-        'today_appointments' => $db->query("SELECT COUNT(*) as total FROM appointments WHERE appointment_date = CURDATE() AND status = 'scheduled'")->fetch_assoc()['total'] ?? 0,
-        'pending_payments' => $db->query("SELECT COUNT(*) as total FROM payments WHERE status = 'pending'")->fetch_assoc()['total'] ?? 0,
-        'total_fee_changes' => $db->query("SELECT COUNT(*) as total FROM fee_audit_log")->fetch_assoc()['total'] ?? 0,
-    ];
-} catch (Exception $e) {
-    $stats = [
-        'total_revenue' => 0,
-        'total_patients' => 0,
-        'total_doctors' => 0,
-        'today_appointments' => 0,
-        'pending_payments' => 0,
-        'total_fee_changes' => 0,
-    ];
-    $error = "Stats calculation error: " . $e->getMessage();
-}
+// Chamber revenue breakdown
+$chamber_revenue = $db->query("
+    SELECT c.chamber_name, d.name as doctor_name, SUM(c.chamber_fee) as platform_revenue
+    FROM chambers c 
+    JOIN doctors d ON c.doctor_id = d.id
+    JOIN appointments a ON c.id = a.chamber_id
+    JOIN payments p ON a.id = p.appointment_id AND p.status = 'paid'
+    GROUP BY c.id, c.chamber_name, d.name
+    ORDER BY platform_revenue DESC
+");
 ?>
 
 <?php include 'includes/header.php'; ?>
@@ -188,226 +55,115 @@ try {
 <div class="space-y-6">
     <!-- Header -->
     <div class="bg-white rounded-lg shadow p-4">
-        <h1 class="text-xl font-bold text-gray-800">Analytics & Advanced Queries</h1>
-        <p class="text-gray-600 text-sm">Using Database Functions, Views, Triggers & Advanced SQL Features</p>
+        <h1 class="text-xl font-bold text-gray-800">Analytics Dashboard</h1>
+        <p class="text-gray-600 text-sm">Revenue analysis and platform performance metrics</p>
     </div>
 
-    <!-- Error Display -->
-    <?php if (isset($error)): ?>
-        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4 text-sm">
-            <strong>Error:</strong> <?= htmlspecialchars($error) ?>
-        </div>
-    <?php endif; ?>
-
-    <!-- Aggregate Stats -->
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]">৳<?= number_format($stats['total_revenue'], 2) ?></div>
+    <!-- Key Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="bg-white rounded-lg shadow p-4 border-l-4 border-green-500">
+            <div class="text-xl font-bold text-green-600">৳<?= number_format($total_revenue, 2) ?></div>
             <div class="text-xs text-gray-600">Total Revenue</div>
         </div>
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]"><?= $stats['total_patients'] ?></div>
-            <div class="text-xs text-gray-600">Total Patients</div>
+        <div class="bg-white rounded-lg shadow p-4 border-l-4 border-blue-500">
+            <div class="text-xl font-bold text-blue-600">৳<?= number_format($platform_revenue, 2) ?></div>
+            <div class="text-xs text-gray-600">Platform Revenue</div>
         </div>
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]"><?= $stats['total_doctors'] ?></div>
-            <div class="text-xs text-gray-600">Total Doctors</div>
+        <div class="bg-white rounded-lg shadow p-4 border-l-4 border-purple-500">
+            <div class="text-xl font-bold text-purple-600"><?= $total_appointments ?></div>
+            <div class="text-xs text-gray-600">Total Appointments</div>
         </div>
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]"><?= $stats['today_appointments'] ?></div>
-            <div class="text-xs text-gray-600">Today's Appointments</div>
-        </div>
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]"><?= $stats['pending_payments'] ?></div>
-            <div class="text-xs text-gray-600">Pending Payments</div>
-        </div>
-        <div class="bg-white rounded-lg shadow p-4 text-center border-l-4 border-[#20B2AA]">
-            <div class="text-xl font-bold text-[#20B2AA]"><?= $stats['total_fee_changes'] ?></div>
-            <div class="text-xs text-gray-600">Fee Changes Logged</div>
+        <div class="bg-white rounded-lg shadow p-4 border-l-4 border-orange-500">
+            <div class="text-xl font-bold text-orange-600"><?= $completed_appointments ?></div>
+            <div class="text-xs text-gray-600">Completed Appointments</div>
         </div>
     </div>
 
-    <!-- Doctor Monthly Revenue -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="border-b px-4 py-3">
-            <h2 class="font-semibold text-gray-800 text-sm">Doctor Monthly Revenue</h2>
+    <!-- Revenue Breakdown -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Doctor Performance -->
+        <div class="bg-white rounded-lg shadow p-4">
+            <h3 class="font-semibold mb-4 text-gray-800">Doctor Performance</h3>
+            <div class="space-y-3 text-sm">
+                <?php while ($doc = $doctor_performance->fetch_assoc()): ?>
+                    <div class="flex justify-between items-center border-b pb-2">
+                        <div>
+                            <div class="font-medium"><?= $doc['name'] ?></div>
+                            <div class="text-gray-500 text-xs"><?= $doc['speciality'] ?></div>
+                        </div>
+                        <div class="text-right">
+                            <div class="font-medium">৳<?= number_format($doc['revenue'] ?? 0, 2) ?></div>
+                            <div class="text-gray-500 text-xs"><?= $doc['appointments'] ?> apps</div>
+                        </div>
+                    </div>
+                <?php endwhile; ?>
+            </div>
         </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full text-sm">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Doctor</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Speciality</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Current Month</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Last Month</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-200">
-                    <?php if ($doctor_monthly_revenue && $doctor_monthly_revenue->num_rows > 0): ?>
-                        <?php while($row = $doctor_monthly_revenue->fetch_assoc()): ?>
-                        <tr class="hover:bg-gray-50">
-                            <td class="py-2 px-4"> <?= htmlspecialchars($row['name']) ?></td>
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['speciality']) ?></td>
-                            <td class="py-2 px-4 font-semibold text-[#20B2AA]">৳<?= number_format($row['current_month_revenue'], 2) ?></td>
-                            <td class="py-2 px-4">৳<?= number_format($row['last_month_revenue'], 2) ?></td>
-                        </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="4" class="py-4 px-4 text-center text-gray-500">No revenue data available</td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
+
+        <!-- Speciality Revenue -->
+        <div class="bg-white rounded-lg shadow p-4">
+            <h3 class="font-semibold mb-4 text-gray-800">Revenue by Speciality</h3>
+            <div class="space-y-3 text-sm">
+                <?php while ($spec = $speciality_revenue->fetch_assoc()): ?>
+                    <div class="flex justify-between items-center border-b pb-2">
+                        <div class="font-medium"><?= $spec['speciality'] ?></div>
+                        <div class="text-[#20B2AA] font-medium">৳<?= number_format($spec['revenue'], 2) ?></div>
+                    </div>
+                <?php endwhile; ?>
+            </div>
+        </div>
+
+        <!-- Platform Revenue Breakdown -->
+        <div class="bg-white rounded-lg shadow p-4">
+            <h3 class="font-semibold mb-4 text-gray-800">Platform Revenue by Chamber</h3>
+            <div class="space-y-3 text-sm">
+                <?php while ($chamber = $chamber_revenue->fetch_assoc()): ?>
+                    <div class="flex justify-between items-center border-b pb-2">
+                        <div>
+                            <div class="font-medium"><?= $chamber['chamber_name'] ?></div>
+                            <div class="text-gray-500 text-xs"><?= $chamber['doctor_name'] ?></div>
+                        </div>
+                        <div class="text-[#20B2AA] font-medium">৳<?= number_format($chamber['platform_revenue'], 2) ?></div>
+                    </div>
+                <?php endwhile; ?>
+            </div>
+        </div>
+
+        <!-- Monthly Revenue Trend -->
+        <div class="bg-white rounded-lg shadow p-4">
+            <h3 class="font-semibold mb-4 text-gray-800">Monthly Revenue Trend</h3>
+            <div class="space-y-3 text-sm">
+                <?php while ($month = $monthly_revenue->fetch_assoc()): ?>
+                    <div class="flex justify-between items-center border-b pb-2">
+                        <div class="font-medium">
+                            <?= date('F Y', mktime(0, 0, 0, $month['month'], 1, $month['year'])) ?>
+                        </div>
+                        <div class="text-green-600 font-medium">৳<?= number_format($month['revenue'], 2) ?></div>
+                    </div>
+                <?php endwhile; ?>
+            </div>
         </div>
     </div>
 
-    <!-- Fee Change Audit -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="border-b px-4 py-3">
-            <h2 class="font-semibold text-gray-800 text-sm">Fee Change History</h2>
-        </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full text-sm">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Doctor</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Old Fee</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">New Fee</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Change Date</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-200">
-                    <?php if ($fee_changes && $fee_changes->num_rows > 0): ?>
-                        <?php while($row = $fee_changes->fetch_assoc()): ?>
-                        <tr class="hover:bg-gray-50">
-                            <td class="py-2 px-4"> <?= htmlspecialchars($row['doctor_name']) ?></td>
-                            <td class="py-2 px-4">৳<?= number_format($row['old_fee'], 2) ?></td>
-                            <td class="py-2 px-4 font-semibold <?= $row['new_fee'] > $row['old_fee'] ? 'text-green-600' : 'text-red-600' ?>">
-                                ৳<?= number_format($row['new_fee'], 2) ?>
-                            </td>
-                            <td class="py-2 px-4 text-xs"><?= htmlspecialchars($row['changed_at']) ?></td>
-                        </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="4" class="py-4 px-4 text-center text-gray-500">No fee changes recorded</td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <!-- Doctor Performance -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="border-b px-4 py-3">
-            <h2 class="font-semibold text-gray-800 text-sm">Doctor Performance</h2>
-        </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full text-sm">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Doctor</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Speciality</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Total Appointments</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Completed</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Total Revenue</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-200">
-                    <?php if ($doctor_performance && $doctor_performance->num_rows > 0): ?>
-                        <?php while($row = $doctor_performance->fetch_assoc()): ?>
-                        <tr class="hover:bg-gray-50">
-                            <td class="py-2 px-4"> <?= htmlspecialchars($row['name']) ?></td>
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['speciality']) ?></td>
-                            <td class="py-2 px-4"><?= $row['total_appointments'] ?></td>
-                            <td class="py-2 px-4"><?= $row['completed_appointments'] ?? 'N/A' ?></td>
-                            <td class="py-2 px-4 font-semibold text-[#20B2AA]">৳<?= number_format($row['total_revenue'], 2) ?></td>
-                        </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="5" class="py-4 px-4 text-center text-gray-500">No performance data available</td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <!-- Today's Appointments -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="border-b px-4 py-3">
-            <h2 class="font-semibold text-gray-800 text-sm">Today's Appointments</h2>
-        </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full text-sm">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Time</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Patient</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Doctor</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Speciality</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Chamber</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-200">
-                    <?php if ($todays_appointments && $todays_appointments->num_rows > 0): ?>
-                        <?php while($row = $todays_appointments->fetch_assoc()): ?>
-                        <tr class="hover:bg-gray-50">
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['appointment_time']) ?></td>
-                            <td class="py-2 px-4">
-                                <div><?= htmlspecialchars($row['patient_name']) ?></div>
-                                <div class="text-xs text-gray-500"><?= htmlspecialchars($row['patient_phone'] ?? '') ?></div>
-                            </td>
-                            <td class="py-2 px-4"> <?= htmlspecialchars($row['doctor_name']) ?></td>
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['speciality']) ?></td>
-                            <td class="py-2 px-4 text-xs"><?= htmlspecialchars($row['chamber_name'] ?? 'N/A') ?></td>
-                        </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="5" class="py-4 px-4 text-center text-gray-500">No appointments scheduled for today</td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <!-- Monthly Revenue Analytics -->
-    <div class="bg-white rounded-lg shadow">
-        <div class="border-b px-4 py-3">
-            <h2 class="font-semibold text-gray-800 text-sm">Monthly Revenue Analytics</h2>
-        </div>
-        <div class="overflow-x-auto">
-            <table class="min-w-full text-sm">
-                <thead class="bg-gray-50">
-                    <tr>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Month</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Speciality</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Appointments</th>
-                        <th class="text-left py-2 px-4 font-medium text-gray-700">Revenue</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-200">
-                    <?php if ($monthly_revenue && $monthly_revenue->num_rows > 0): ?>
-                        <?php while($row = $monthly_revenue->fetch_assoc()): ?>
-                        <tr class="hover:bg-gray-50">
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['month']) ?></td>
-                            <td class="py-2 px-4"><?= htmlspecialchars($row['speciality']) ?></td>
-                            <td class="py-2 px-4"><?= $row['appointment_count'] ?></td>
-                            <td class="py-2 px-4 font-semibold text-[#20B2AA]">৳<?= number_format($row['total_revenue'], 2) ?></td>
-                        </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="4" class="py-4 px-4 text-center text-gray-500">No revenue data available</td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
+    <!-- Fee Structure Explanation -->
+    <div class="bg-white rounded-lg shadow p-4">
+        <h3 class="font-semibold mb-3 text-gray-800">Fee Structure</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+            <div class="border rounded-lg p-4">
+                <h4 class="font-medium text-[#20B2AA] mb-2">Consultation Fee</h4>
+                <p class="text-gray-600">Doctor's professional fee for medical consultation</p>
+                <div class="mt-2 text-lg font-bold">৳500 - ৳1,500</div>
+            </div>
+            <div class="border rounded-lg p-4">
+                <h4 class="font-medium text-[#20B2AA] mb-2">Chamber Fee</h4>
+                <p class="text-gray-600">Platform fee for chamber facility and management</p>
+                <div class="mt-2 text-lg font-bold">৳150 - ৳250</div>
+            </div>
+            <div class="border rounded-lg p-4">
+                <h4 class="font-medium text-[#20B2AA] mb-2">Total Fee</h4>
+                <p class="text-gray-600">Sum of consultation fee and chamber fee</p>
+                <div class="mt-2 text-lg font-bold">Consultation + Chamber</div>
+            </div>
         </div>
     </div>
 </div>
